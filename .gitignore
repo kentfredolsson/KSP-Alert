@@ -1,0 +1,21 @@
+# Build outputs
+bin/
+obj/
+*.dll
+*.pdb
+
+# IDE
+.vs/
+.idea/
+*.user
+*.suo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sensitive files
+*.env
+*credentials*
+*secret*
+*token*
