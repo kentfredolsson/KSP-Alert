@@ -32,6 +32,7 @@ namespace KSPAlert
         // Landing mode state
         private bool isInLandingMode;
         private int lastAltitudeCallout;  // Track which callout was last triggered
+        private AlertType? persistentCallout;  // Callout that stays visible until VS >= 0 or new callout
 
         private float lastUpdateTime;
         private const float UPDATE_INTERVAL = 0.1f; // 10 Hz update rate
@@ -83,6 +84,7 @@ namespace KSPAlert
             };
 
             lastAltitudeCallout = 999;  // Start with high value
+            persistentCallout = null;
         }
 
         void Update()
@@ -187,6 +189,13 @@ namespace KSPAlert
             if (altitudeAGL > 60)
             {
                 lastAltitudeCallout = 999;
+                persistentCallout = null;
+            }
+
+            // Clear persistent callout if vertical speed >= 0 (stopped descending or climbing)
+            if (verticalSpeed >= 0)
+            {
+                persistentCallout = null;
             }
         }
 
@@ -231,49 +240,56 @@ namespace KSPAlert
 
             // Only call out each altitude once per approach, in descending order
             int currentAlt = (int)altitudeAGL;
-            AlertType? calloutType = null;
+            AlertType? newCalloutType = null;
 
             // Check altitude thresholds - only trigger if we haven't called this one yet
             if (currentAlt <= 5 && lastAltitudeCallout > 5)
             {
-                calloutType = AlertType.Retard;  // RETARD at 5m and below
+                newCalloutType = AlertType.Retard;  // RETARD at 5m and below
                 lastAltitudeCallout = 5;
             }
             else if (currentAlt <= 10 && currentAlt > 5 && lastAltitudeCallout > 10)
             {
-                calloutType = AlertType.Altitude10;
+                newCalloutType = AlertType.Altitude10;
                 lastAltitudeCallout = 10;
             }
             else if (currentAlt <= 20 && currentAlt > 10 && lastAltitudeCallout > 20)
             {
-                calloutType = AlertType.Altitude20;
+                newCalloutType = AlertType.Altitude20;
                 lastAltitudeCallout = 20;
             }
             else if (currentAlt <= 30 && currentAlt > 20 && lastAltitudeCallout > 30)
             {
-                calloutType = AlertType.Altitude30;
+                newCalloutType = AlertType.Altitude30;
                 lastAltitudeCallout = 30;
             }
             else if (currentAlt <= 40 && currentAlt > 30 && lastAltitudeCallout > 40)
             {
-                calloutType = AlertType.Altitude40;
+                newCalloutType = AlertType.Altitude40;
                 lastAltitudeCallout = 40;
             }
             else if (currentAlt <= 50 && currentAlt > 40 && lastAltitudeCallout > 50)
             {
-                calloutType = AlertType.Altitude50;
+                newCalloutType = AlertType.Altitude50;
                 lastAltitudeCallout = 50;
             }
 
-            if (calloutType.HasValue && alerts.ContainsKey(calloutType.Value))
+            // If we have a new callout, trigger it and update persistent callout
+            if (newCalloutType.HasValue && alerts.ContainsKey(newCalloutType.Value))
             {
-                var alert = alerts[calloutType.Value];
+                var alert = alerts[newCalloutType.Value];
                 if (alert.CanTrigger())
                 {
                     alert.Trigger();
                     audio?.PlayAlert(alert);
                 }
+                persistentCallout = newCalloutType.Value;
                 activeAlerts.Add(alert);
+            }
+            // Otherwise, keep showing the persistent callout until VS >= 0
+            else if (persistentCallout.HasValue && alerts.ContainsKey(persistentCallout.Value))
+            {
+                activeAlerts.Add(alerts[persistentCallout.Value]);
             }
         }
 
@@ -283,13 +299,19 @@ namespace KSPAlert
 
             var alert = alerts[AlertType.Terrain];
 
-            // Calculate time to impact based on current descent rate
-            // Only valid if descending (negative vertical speed)
-            double timeToImpact = double.MaxValue;
+            // Calculate time to impact based on current descent rate (vertical only)
+            double verticalTimeToImpact = double.MaxValue;
             if (verticalSpeed < -1) // Descending at least 1 m/s
             {
-                timeToImpact = altitudeAGL / (-verticalSpeed);
+                verticalTimeToImpact = altitudeAGL / (-verticalSpeed);
             }
+
+            // Calculate forward-looking time to impact using velocity vector
+            // This detects flying into mountains horizontally
+            double forwardTimeToImpact = CalculateForwardTerrainImpact();
+
+            // Use the smaller of the two (most imminent danger)
+            double timeToImpact = System.Math.Min(verticalTimeToImpact, forwardTimeToImpact);
 
             // Trigger if:
             // 1. Time to impact is less than configured seconds (default 6.5s), OR
@@ -316,6 +338,118 @@ namespace KSPAlert
             {
                 alert.Clear();
             }
+        }
+
+        /// <summary>
+        /// Calculate time to terrain impact by checking terrain height along the velocity vector.
+        /// This detects flying horizontally into mountains.
+        /// </summary>
+        private double CalculateForwardTerrainImpact()
+        {
+            if (vessel == null || vessel.mainBody == null) return double.MaxValue;
+
+            // Get surface velocity (velocity relative to the ground)
+            Vector3d surfaceVelocity = vessel.srf_velocity;
+            double speed = surfaceVelocity.magnitude;
+
+            // Only check if moving fast enough
+            if (speed < 10) return double.MaxValue;
+
+            // Normalize velocity direction
+            Vector3d velocityDirection = surfaceVelocity.normalized;
+
+            // Check terrain at multiple points along the flight path
+            // Look ahead up to the warning time distance
+            double lookAheadDistance = speed * Config.TerrainWarningTime;
+            double minTimeToImpact = double.MaxValue;
+
+            // Sample points along the trajectory (every ~100m or so)
+            int numSamples = Mathf.Min(20, Mathf.Max(5, (int)(lookAheadDistance / 100)));
+            double stepDistance = lookAheadDistance / numSamples;
+
+            Vector3d currentPos = vessel.CoMD; // World position of vessel center of mass
+
+            for (int i = 1; i <= numSamples; i++)
+            {
+                double distance = stepDistance * i;
+                double timeAtPoint = distance / speed;
+
+                // Calculate position along velocity vector
+                Vector3d futurePos = currentPos + velocityDirection * distance;
+
+                // Get terrain height at that position
+                double terrainHeight = GetTerrainHeightAtPosition(futurePos);
+
+                // Get altitude of vessel at that future position (accounting for descent)
+                double futureAltitude = vessel.altitude + verticalSpeed * timeAtPoint;
+
+                // Calculate AGL at future position
+                double futureAGL = futureAltitude - terrainHeight;
+
+                // If we would be below terrain, calculate time to impact
+                if (futureAGL < 0)
+                {
+                    // We hit terrain somewhere between previous sample and this one
+                    // Linear interpolation to find approximate impact time
+                    if (i > 1)
+                    {
+                        double prevDistance = stepDistance * (i - 1);
+                        double prevTime = prevDistance / speed;
+                        Vector3d prevPos = currentPos + velocityDirection * prevDistance;
+                        double prevTerrainHeight = GetTerrainHeightAtPosition(prevPos);
+                        double prevFutureAltitude = vessel.altitude + verticalSpeed * prevTime;
+                        double prevFutureAGL = prevFutureAltitude - prevTerrainHeight;
+
+                        // Interpolate between prev (positive AGL) and current (negative AGL)
+                        if (prevFutureAGL > 0)
+                        {
+                            double t = prevFutureAGL / (prevFutureAGL - futureAGL);
+                            minTimeToImpact = prevTime + t * (timeAtPoint - prevTime);
+                        }
+                        else
+                        {
+                            minTimeToImpact = timeAtPoint;
+                        }
+                    }
+                    else
+                    {
+                        minTimeToImpact = timeAtPoint;
+                    }
+                    break;
+                }
+
+                // Also check if terrain is rising dangerously close
+                // If AGL at future point is very low, that's also dangerous
+                if (futureAGL < 50 && futureAGL > 0) // Less than 50m clearance
+                {
+                    // Time until we reach that low clearance point
+                    if (timeAtPoint < minTimeToImpact)
+                    {
+                        minTimeToImpact = timeAtPoint;
+                    }
+                }
+            }
+
+            return minTimeToImpact;
+        }
+
+        /// <summary>
+        /// Get terrain height at a world position
+        /// </summary>
+        private double GetTerrainHeightAtPosition(Vector3d worldPos)
+        {
+            if (vessel == null || vessel.mainBody == null) return 0;
+
+            CelestialBody body = vessel.mainBody;
+
+            // Convert world position to latitude/longitude
+            double lat = body.GetLatitude(worldPos);
+            double lon = body.GetLongitude(worldPos);
+
+            // Get terrain height at that lat/lon
+            double terrainHeight = body.TerrainAltitude(lat, lon, true);
+
+            return terrainHeight;
         }
 
         private void CheckGearAlert()
